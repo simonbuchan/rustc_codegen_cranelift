@@ -30,10 +30,18 @@ impl ArchiveBuilderBuilder for ArArchiveBuilderBuilder {
             )
         }
 
-        let mut import_lib = crate::dll_import_lib::ImportLibraryBuilder::new(
+        let mut import_lib = match crate::dll_import_lib::ImportLibraryBuilder::new(
             lib_name,
             crate::dll_import_lib::Machine::X86_64,
-        );
+        ) {
+            Ok(import_lib) => import_lib,
+            Err(error) => {
+                sess.fatal(format!(
+                    "failed to create import library `{lib_name}`: {error}",
+                    lib_name = lib_name,
+                ));
+            }
+        };
 
         for import in dll_imports {
             import_lib.add_import(crate::dll_import_lib::Import {

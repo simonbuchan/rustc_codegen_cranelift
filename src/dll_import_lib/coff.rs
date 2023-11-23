@@ -42,12 +42,43 @@
 //   0: string_table_size: u32,         // including this size
 //   4: sequence of null-terminated strings
 
-use object::pe::*;
-use object::{LittleEndian as LE, U16Bytes, U32Bytes};
 use std::ops::{Deref, DerefMut};
+
+use object::pe::*;
+use object::write::coff::{FileHeader, Relocation, SectionHeader, Symbol, Writer};
+use object::{LittleEndian as LE, U16Bytes, U32Bytes};
 
 use super::data::DataWriter;
 use super::string_table::StringTable;
+
+#[derive(Debug, Clone)]
+pub(crate) enum Error {
+    OutOfRange,
+    Write(object::write::Error),
+}
+
+impl From<std::num::TryFromIntError> for Error {
+    fn from(_: std::num::TryFromIntError) -> Self {
+        Self::OutOfRange
+    }
+}
+
+impl From<object::write::Error> for Error {
+    fn from(value: object::write::Error) -> Self {
+        Self::Write(value)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.clone() {
+            Self::OutOfRange => write!(f, "value out of range"),
+            Self::Write(value) => write!(f, "COFF format error: {}", value),
+        }
+    }
+}
+
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) const NULL_IMPORT_DESCRIPTOR_SYMBOL: &str = "__NULL_IMPORT_DESCRIPTOR";
 
@@ -61,6 +92,12 @@ impl Machine {
     fn as_raw(self) -> u16 {
         match self {
             Self::X86_64 => IMAGE_FILE_MACHINE_AMD64,
+        }
+    }
+
+    fn relocation_type(self) -> u16 {
+        match self {
+            Self::X86_64 => IMAGE_REL_AMD64_ADDR32NB,
         }
     }
 }
@@ -218,7 +255,7 @@ impl ImportDescriptorValues {
 
 /// Return a COFF object file containing the import descriptor table entry for the
 /// given DLL name.
-pub(crate) fn generate_import_descriptor(values: &ImportDescriptorValues) -> Vec<u8> {
+pub(crate) fn generate_import_descriptor(values: &ImportDescriptorValues) -> Result<Vec<u8>> {
     // This is a COFF object containing 2 sections:
     //   .idata$2: import directory entry:
     //      20 bytes, all 0 on disk, an Import Directory Table entry
@@ -229,7 +266,7 @@ pub(crate) fn generate_import_descriptor(values: &ImportDescriptorValues) -> Vec
     //    0: [3] import lookup table rva => points to UNDEF symbol .idata$4
     //   12: [2] name rva => points to DLL name section .idata$6
     //   16: [4] import address table rva => points to UNDEF symbol .idata$5
-    // The COFF symbol table contains 5 symbols:
+    // The COFF symbol table contains 7 symbols:
     //  [0]: external __IMPORT_DESCRIPTOR_{dll_basename} => section 1
     //  [1]: section .idata$2 => section 1
     //  [2]: static .idata$6 => section 2
@@ -239,109 +276,130 @@ pub(crate) fn generate_import_descriptor(values: &ImportDescriptorValues) -> Vec
     //  [6]: external __NULL_THUNK_DATA => undef
 
     // COFF File header:
-    let mut writer = DataWriter::new();
+    let mut data = Vec::new();
+    let mut writer = Writer::new(&mut data);
 
-    let mut file = CoffFileWriter::new(&mut writer, values.machine);
+    let import_descriptor_symbol = writer.add_name(values.import_descriptor_symbol.as_bytes());
+    let null_import_descriptor_symbol = writer.add_name(NULL_IMPORT_DESCRIPTOR_SYMBOL.as_bytes());
+    let null_thunk_data_symbol = writer.add_name(values.null_thunk_data_symbol.as_bytes());
 
-    // Section table:
-    //   [0] .idata$2: import directory entry
-    let import_directory_header = file.write_section_header(
-        ".idata$2",
-        IMAGE_SCN_ALIGN_4BYTES
+    let import_directory_raw_data_size = 20;
+    let mut import_directory_header = SectionHeader {
+        name: b".idata$2".into(),
+        size_of_raw_data: import_directory_raw_data_size,
+        number_of_relocations: 3,
+        characteristics: IMAGE_SCN_ALIGN_4BYTES
             | IMAGE_SCN_CNT_INITIALIZED_DATA
             | IMAGE_SCN_MEM_READ
             | IMAGE_SCN_MEM_WRITE,
-    );
-    //   [1] .idata$6: dll name
-    let dll_name_header = file.write_section_header(
-        ".idata$6",
-        IMAGE_SCN_ALIGN_2BYTES
+        ..Default::default()
+    };
+    let mut dll_name_header = SectionHeader {
+        name: b".idata$6".into(),
+        size_of_raw_data: (values.dll_name.len() + 1).try_into()?,
+        characteristics: IMAGE_SCN_ALIGN_2BYTES
             | IMAGE_SCN_CNT_INITIALIZED_DATA
             | IMAGE_SCN_MEM_READ
             | IMAGE_SCN_MEM_WRITE,
-    );
+        ..Default::default()
+    };
+
+    writer.reserve_file_header();
+    writer.reserve_section_headers(2);
+
+    let import_directory_raw_data_offset =
+        writer.reserve_section(import_directory_header.size_of_raw_data.try_into()?);
+    import_directory_header.pointer_to_raw_data = import_directory_raw_data_offset;
+    let import_directory_relocations_offset =
+        writer.reserve_relocations(import_directory_header.number_of_relocations.try_into()?);
+    import_directory_header.pointer_to_relocations = import_directory_relocations_offset;
+
+    let dll_name_raw_data_offset =
+        writer.reserve_section(dll_name_header.size_of_raw_data.try_into()?);
+    dll_name_header.pointer_to_raw_data = dll_name_raw_data_offset;
+
+    writer.reserve_symbol_indices(7);
+    writer.reserve_symtab_strtab();
+
+    writer
+        .write_file_header(FileHeader { machine: values.machine.as_raw(), ..Default::default() })?;
+    writer.write_section_header(import_directory_header);
+    writer.write_section_header(dll_name_header);
 
     // [0] section .idata$2 data
-    CoffSectionRawData::new(&mut file, import_directory_header).reserve_bytes(20);
+    writer.write_align(4);
+    assert_eq!(writer.len(), usize::try_from(import_directory_raw_data_offset)?);
+    writer.write_section_zeroes(import_directory_raw_data_size.try_into()?);
 
-    // [0] section .idata$2 relocations
-    let import_descriptor_pointer_to_relocations = file.data.len() - file.offset;
-
-    let header = import_directory_header.get_mut(file.data);
-    header.number_of_relocations = make_u16(3);
-
-    header.pointer_to_relocations = make_u32(import_descriptor_pointer_to_relocations as u32);
-
-    // todo: CoffRelocWriter
+    assert_eq!(writer.len(), usize::try_from(import_directory_relocations_offset)?);
 
     //   relocation 0: [3] import lookup table rva => points to UNDEF symbol .idata$4
-    file.data.write_pod(&ImageRelocation {
-        virtual_address: make_u32(0),
-        symbol_table_index: make_u32(3),
-        typ: make_u16(IMAGE_REL_AMD64_ADDR32NB),
+    writer.write_relocation(Relocation {
+        virtual_address: 0,
+        symbol: 3,
+        typ: values.machine.relocation_type(),
     });
     //   relocation 1: [2] name rva => points to DLL name section .idata$6
-    file.data.write_pod(&ImageRelocation {
-        virtual_address: make_u32(12),
-        symbol_table_index: make_u32(2),
-        typ: make_u16(IMAGE_REL_AMD64_ADDR32NB),
+    writer.write_relocation(Relocation {
+        virtual_address: 12,
+        symbol: 2,
+        typ: values.machine.relocation_type(),
     });
     //   relocation 2: [4] import address table rva => points to UNDEF symbol .idata$5
-    file.data.write_pod(&ImageRelocation {
-        virtual_address: make_u32(16),
-        symbol_table_index: make_u32(4),
-        typ: make_u16(IMAGE_REL_AMD64_ADDR32NB),
+    writer.write_relocation(Relocation {
+        virtual_address: 16,
+        symbol: 4,
+        typ: values.machine.relocation_type(),
     });
 
     // [1] section .idata$6 data
-    CoffSectionRawData::new(&mut file, dll_name_header).write_c_str(&values.dll_name);
+    writer.write_align(4);
+    assert_eq!(writer.len(), usize::try_from(dll_name_raw_data_offset)?);
+    writer.write(values.dll_name.as_bytes());
+    writer.write(&[0u8]);
 
     // COFF symbol table:
-    let mut symbol_table = file.start_symbol_table();
-    symbol_table.add(
-        &values.import_descriptor_symbol,
-        SymbolOptions {
-            section_number: 1,
-            storage_class: IMAGE_SYM_CLASS_EXTERNAL,
-            ..Default::default()
-        },
-    );
-    symbol_table.add(
-        ".idata$2",
-        SymbolOptions {
-            section_number: 1,
-            storage_class: IMAGE_SYM_CLASS_SECTION,
-            ..Default::default()
-        },
-    );
-    symbol_table.add(
-        ".idata$6",
-        SymbolOptions {
-            section_number: 2,
-            storage_class: IMAGE_SYM_CLASS_STATIC,
-            ..Default::default()
-        },
-    );
-    symbol_table.add(
-        ".idata$4",
-        SymbolOptions { storage_class: IMAGE_SYM_CLASS_SECTION, ..Default::default() },
-    );
-    symbol_table.add(
-        ".idata$5",
-        SymbolOptions { storage_class: IMAGE_SYM_CLASS_SECTION, ..Default::default() },
-    );
-    symbol_table.add(
-        NULL_IMPORT_DESCRIPTOR_SYMBOL,
-        SymbolOptions { storage_class: IMAGE_SYM_CLASS_EXTERNAL, ..Default::default() },
-    );
-    symbol_table.add(
-        &values.null_thunk_data_symbol,
-        SymbolOptions { storage_class: IMAGE_SYM_CLASS_EXTERNAL, ..Default::default() },
-    );
-    drop(symbol_table);
-    drop(file);
+    writer.write_symbol(Symbol {
+        name: import_descriptor_symbol,
+        section_number: 1,
+        storage_class: IMAGE_SYM_CLASS_EXTERNAL,
+        ..Default::default()
+    });
+    writer.write_symbol(Symbol {
+        name: b".idata$2".into(),
+        section_number: 1,
+        storage_class: IMAGE_SYM_CLASS_SECTION,
+        ..Default::default()
+    });
+    writer.write_symbol(Symbol {
+        name: b".idata$6".into(),
+        section_number: 2,
+        storage_class: IMAGE_SYM_CLASS_STATIC,
+        ..Default::default()
+    });
+    writer.write_symbol(Symbol {
+        name: b".idata$4".into(),
+        storage_class: IMAGE_SYM_CLASS_SECTION,
+        ..Default::default()
+    });
+    writer.write_symbol(Symbol {
+        name: b".idata$5".into(),
+        storage_class: IMAGE_SYM_CLASS_SECTION,
+        ..Default::default()
+    });
+    writer.write_symbol(Symbol {
+        name: null_import_descriptor_symbol,
+        storage_class: IMAGE_SYM_CLASS_EXTERNAL,
+        ..Default::default()
+    });
+    writer.write_symbol(Symbol {
+        name: null_thunk_data_symbol,
+        storage_class: IMAGE_SYM_CLASS_EXTERNAL,
+        ..Default::default()
+    });
+    writer.write_strtab();
 
-    writer.into_data()
+    Ok(data)
 }
 
 pub(crate) fn generate_null_thunk_data(machine: Machine, symbol: &str) -> Vec<u8> {

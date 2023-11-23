@@ -21,16 +21,16 @@ pub(crate) struct ImportLibraryBuilder {
 }
 
 impl ImportLibraryBuilder {
-    pub(crate) fn new(dll_name: &str, machine: Machine) -> Self {
+    pub(crate) fn new(dll_name: &str, machine: Machine) -> coff::Result<Self> {
         let values = ImportDescriptorValues::new(dll_name.to_string(), machine);
         let mut members = Vec::new();
-        members.push(coff_member(dll_name, coff::generate_import_descriptor(&values)));
+        members.push(coff_member(dll_name, coff::generate_import_descriptor(&values)?));
         members.push(coff_member(
             dll_name,
             coff::generate_null_thunk_data(machine, &values.null_thunk_data_symbol),
         ));
         members.push(coff_member(dll_name, coff::generate_null_import_descriptor(machine)));
-        Self { dll_name: values.dll_name, machine, members }
+        Ok(Self { dll_name: values.dll_name, machine, members })
     }
 
     pub(crate) fn add_import(&mut self, import: Import) {
