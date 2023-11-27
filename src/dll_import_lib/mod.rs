@@ -1,6 +1,4 @@
-// todo: pull out to a proper location. Really should be in `object` crate!
 // todo: support windows-gnu flavor?
-// todo: provide machine
 // todo: remove any panics, nice errors
 
 use std::ffi::CStr;
@@ -8,8 +6,6 @@ use std::ffi::CStr;
 use object::{Object, ObjectSymbol};
 
 mod coff;
-mod data;
-mod string_table;
 
 use crate::dll_import_lib::coff::ImportDescriptorValues;
 pub(crate) use coff::{Import, ImportNameType, ImportType, Machine};
@@ -23,13 +19,14 @@ pub(crate) struct ImportLibraryBuilder {
 impl ImportLibraryBuilder {
     pub(crate) fn new(dll_name: &str, machine: Machine) -> coff::Result<Self> {
         let values = ImportDescriptorValues::new(dll_name.to_string(), machine);
-        let mut members = Vec::new();
-        members.push(coff_member(dll_name, coff::generate_import_descriptor(&values)?));
-        members.push(coff_member(
-            dll_name,
-            coff::generate_null_thunk_data(machine, &values.null_thunk_data_symbol),
-        ));
-        members.push(coff_member(dll_name, coff::generate_null_import_descriptor(machine)));
+        let members = vec![
+            coff_member(dll_name, coff::generate_import_descriptor(&values)?),
+            coff_member(
+                dll_name,
+                coff::generate_null_thunk_data(machine, &values.null_thunk_data_symbol)?,
+            ),
+            coff_member(dll_name, coff::generate_null_import_descriptor(machine)?),
+        ];
         Ok(Self { dll_name: values.dll_name, machine, members })
     }
 

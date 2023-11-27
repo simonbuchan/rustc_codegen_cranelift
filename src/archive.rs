@@ -6,8 +6,6 @@ use rustc_codegen_ssa::back::archive::{
 };
 use rustc_session::Session;
 
-struct UnsupportedTargetForRawDyLib;
-
 pub(crate) struct ArArchiveBuilderBuilder;
 
 impl ArchiveBuilderBuilder for ArArchiveBuilderBuilder {
