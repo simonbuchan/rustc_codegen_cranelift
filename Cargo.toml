@@ -33,7 +33,7 @@ smallvec = "1.8.1"
 #cranelift-object = { path = "../wasmtime/cranelift/object" }
 
 #gimli = { path = "../" }
-object = { git = "https://github.com/philipc/object", branch = "coff-writer" }
+object = { git = "https://github.com/gimli-rs/object" }
 
 [features]
 # Enable features not ready to be enabled when compiling as part of rustc
