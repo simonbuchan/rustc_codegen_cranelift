@@ -10,7 +10,11 @@ pub(crate) struct ArArchiveBuilderBuilder;
 
 impl ArchiveBuilderBuilder for ArArchiveBuilderBuilder {
     fn new_archive_builder<'a>(&self, sess: &'a Session) -> Box<dyn ArchiveBuilder<'a> + 'a> {
-        Box::new(ArArchiveBuilder::new(sess, get_import_or_native_object_symbols))
+        if sess.target.arch != "x86_64" || !sess.target.is_like_msvc {
+            Box::new(ArArchiveBuilder::new(sess, get_native_object_symbols))
+        } else {
+            Box::new(ArArchiveBuilder::new(sess, crate::dll_import_lib::get_symbols))
+        }
     }
 
     fn create_dll_import_lib(
@@ -28,7 +32,7 @@ impl ArchiveBuilderBuilder for ArArchiveBuilderBuilder {
             )
         }
 
-        let mut import_lib = match crate::dll_import_lib::ImportLibraryBuilder::new(
+        let mut builder = match crate::dll_import_lib::ImportLibraryBuilder::new(
             lib_name,
             crate::dll_import_lib::Machine::X86_64,
         ) {
@@ -42,7 +46,7 @@ impl ArchiveBuilderBuilder for ArArchiveBuilderBuilder {
         };
 
         for import in dll_imports {
-            import_lib.add_import(crate::dll_import_lib::Import {
+            match builder.add_import(crate::dll_import_lib::Import {
                 symbol_name: import.name.to_string(),
                 ordinal_or_hint: import.ordinal(),
                 name_type: match import.import_name_type {
@@ -60,7 +64,16 @@ impl ArchiveBuilderBuilder for ArArchiveBuilderBuilder {
                     }
                 },
                 import_type: crate::dll_import_lib::ImportType::Code,
-            });
+            }) {
+                Ok(()) => {}
+                Err(error) => {
+                    sess.fatal(format!(
+                        "failed to add import `{import}` to import library `{lib_name}`: {error}",
+                        import = import.name,
+                        lib_name = lib_name,
+                    ));
+                }
+            }
         }
 
         let lib_path = tmpdir.join(format!(
@@ -80,7 +93,7 @@ impl ArchiveBuilderBuilder for ArArchiveBuilderBuilder {
         };
 
         // import_lib.write() internally uses BufWriter, so we don't need anything here.
-        if let Err(error) = import_lib.write(&mut file) {
+        if let Err(error) = builder.write(&mut file) {
             sess.fatal(format!(
                 "failed to write import library `{path}`: {error}",
                 path = lib_path.display(),
@@ -88,23 +101,5 @@ impl ArchiveBuilderBuilder for ArArchiveBuilderBuilder {
         }
 
         lib_path
-    }
-}
-
-fn get_import_or_native_object_symbols(
-    buf: &[u8],
-    f: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
-) -> std::io::Result<bool> {
-    let sig1 = u16::from_le_bytes([buf[0], buf[1]]);
-    let sig2 = u16::from_le_bytes([buf[2], buf[3]]);
-    if sig1 == 0 && sig2 == 0xFFFF {
-        let data = &buf[20..];
-        let name_end =
-            data.iter().position(|&c| c == b'\0').expect("import object missing name terminator");
-        let name = &data[..name_end];
-        f(name)?;
-        Ok(true)
-    } else {
-        get_native_object_symbols(buf, f)
     }
 }
